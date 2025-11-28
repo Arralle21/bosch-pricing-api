@@ -3,164 +3,120 @@ import joblib
 import numpy as np
 import pandas as pd
 import os
-import logging
-
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Initialize variables
-model = None
-scaler = None
-feature_columns = None
-
-def load_models():
-    """Load models with fallback to new versions"""
-    global model, scaler, feature_columns
-    
-    try:
-        logger.info("Attempting to load models...")
-        
-        # Try to load new models first, then fallback to old ones
-        model_files = [
-            ('price_optimization_model_new.pkl', 'price_optimization_model.pkl'),
-            ('scaler_new.pkl', 'scaler.pkl'), 
-            ('feature_columns_new.pkl', 'feature_columns.pkl')
-        ]
-        
-        for new_file, old_file in model_files:
-            try:
-                if os.path.exists(new_file):
-                    if 'model' in new_file:
-                        model = joblib.load(new_file)
-                        logger.info(f"✓ Loaded {new_file}")
-                    elif 'scaler' in new_file:
-                        scaler = joblib.load(new_file)
-                        logger.info(f"✓ Loaded {new_file}")
-                    elif 'feature' in new_file:
-                        feature_columns = joblib.load(new_file)
-                        logger.info(f"✓ Loaded {new_file}")
-                elif os.path.exists(old_file):
-                    if 'model' in old_file:
-                        model = joblib.load(old_file)
-                        logger.info(f"✓ Loaded {old_file}")
-                    elif 'scaler' in old_file:
-                        scaler = joblib.load(old_file)
-                        logger.info(f"✓ Loaded {old_file}")
-                    elif 'feature' in old_file:
-                        feature_columns = joblib.load(old_file)
-                        logger.info(f"✓ Loaded {old_file}")
-            except Exception as e:
-                logger.error(f"✗ Failed to load {new_file} or {old_file}: {e}")
-                
-    except Exception as e:
-        logger.error(f"✗ Critical error during model loading: {e}")
-
-# Load models on startup
-load_models()
+# Try to load models, but don't crash if they don't exist yet
+try:
+    model = joblib.load('price_optimization_model.pkl')
+    scaler = joblib.load('scaler.pkl')
+    feature_columns = joblib.load('feature_columns.pkl')
+    models_loaded = True
+    print("✅ All models loaded successfully!")
+except Exception as e:
+    model = None
+    scaler = None
+    feature_columns = None
+    models_loaded = False
+    print(f"⚠️ Models not loaded: {e}")
+    print("💡 Visit /create-models to generate new models")
 
 @app.route('/')
 def home():
-    models_loaded = {
-        'model': model is not None,
-        'scaler': scaler is not None,
-        'feature_columns': feature_columns is not None
-    }
-    
-    status = 'active' if all(models_loaded.values()) else 'degraded'
-    
     return jsonify({
         'message': 'Bosch Price Optimization API',
-        'status': status,
+        'status': 'ready' if models_loaded else 'setup_required',
         'models_loaded': models_loaded,
         'endpoints': {
-            '/predict': 'POST - Predict optimal price',
+            '/': 'GET - API info',
             '/health': 'GET - Health check',
-            '/retrain': 'GET - Retrain models (development)'
+            '/create-models': 'GET - Create new models',
+            '/predict': 'POST - Predict optimal price'
         }
     })
 
 @app.route('/health')
 def health():
-    if all([model, scaler, feature_columns]):
-        return jsonify({'status': 'healthy'})
-    else:
-        return jsonify({
-            'status': 'degraded',
-            'message': 'Some models failed to load',
-            'loaded_models': {
-                'model': model is not None,
-                'scaler': scaler is not None,
-                'feature_columns': feature_columns is not None
-            }
-        }), 503
+    return jsonify({
+        'status': 'healthy' if models_loaded else 'setup_required',
+        'models_ready': models_loaded
+    })
 
-@app.route('/retrain')
-def retrain_models():
-    """Endpoint to retrain models (for development)"""
+@app.route('/create-models')
+def create_models():
+    """Create new compatible models"""
     try:
-        from retrain_models import retrain_models as retrain
-        retrain()
-        # Reload models after retraining
-        load_models()
-        return jsonify({'message': 'Models retrained successfully'})
+        from retrain_models import create_compatible_models
+        success = create_compatible_models()
+        
+        if success:
+            # Reload models
+            global model, scaler, feature_columns, models_loaded
+            model = joblib.load('price_optimization_model.pkl')
+            scaler = joblib.load('scaler.pkl')
+            feature_columns = joblib.load('feature_columns.pkl')
+            models_loaded = True
+            
+            return jsonify({
+                'status': 'success',
+                'message': 'Models created and loaded successfully!'
+            })
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': 'Failed to create models'
+            }), 500
+            
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({
+            'status': 'error',
+            'message': f'Error creating models: {str(e)}'
+        }), 500
 
 @app.route('/predict', methods=['POST'])
 def predict():
+    if not models_loaded:
+        return jsonify({
+            'error': 'Models not loaded',
+            'solution': 'Visit /create-models first to generate models',
+            'status': 'setup_required'
+        }), 503
+    
     try:
-        # Check if all models are loaded
-        if None in [model, scaler, feature_columns]:
-            missing = []
-            if model is None: missing.append('model')
-            if scaler is None: missing.append('scaler')
-            if feature_columns is None: missing.append('feature_columns')
-            
-            return jsonify({
-                'error': f'Models not loaded: {", ".join(missing)}',
-                'status': 'failed',
-                'solution': 'Run /retrain endpoint to create new models'
-            }), 500
-        
         data = request.get_json()
-        if not data:
-            return jsonify({
-                'error': 'No JSON data provided',
-                'status': 'failed'
-            }), 400
         
         # Create input DataFrame
         input_df = pd.DataFrame([data])
         
-        # Ensure all required columns are present
+        # Add missing columns with default values
         for col in feature_columns:
             if col not in input_df.columns:
-                input_df[col] = 0  # or appropriate default value
+                if 'price' in col or 'comp' in col:
+                    input_df[col] = 100.0  # Reasonable default for prices
+                elif 'qty' in col or 'customers' in col:
+                    input_df[col] = 50     # Reasonable default for quantities
+                else:
+                    input_df[col] = 0
         
-        # Reorder columns to match training data
+        # Ensure correct column order
         input_df = input_df[feature_columns]
         
-        # Scale features and predict
+        # Scale and predict
         input_scaled = scaler.transform(input_df)
         prediction = model.predict(input_scaled)[0]
         
         return jsonify({
-            'predicted_price': float(prediction),
+            'predicted_price': round(float(prediction), 2),
             'status': 'success',
             'features_used': len(feature_columns)
         })
-    
+        
     except Exception as e:
-        logger.error(f"Prediction error: {e}")
         return jsonify({
             'error': str(e),
-            'status': 'failed'
+            'status': 'error'
         }), 400
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    logger.info(f"Starting server on port {port}")
     app.run(host='0.0.0.0', port=port)
